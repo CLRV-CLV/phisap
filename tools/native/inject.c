@@ -35,7 +35,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-24";
+static const char INJECT_MARK[] = "phisap-inject-25";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -430,20 +430,12 @@ static void cont_game(pid_t game) {
     if (stopped_game == game) stopped_game = 0;
 }
 
-/* SIGSTOP 之后再阻塞等停住。GETREGS 的 EBUSY 多半是只等了几十毫秒。 */
+/* 必须是 ptrace 停住。整进程 SIGSTOP 只是信号停止，这时写代码页会失败。 */
 static void ensure_stopped(pid_t game, pid_t tid) {
-    int i;
-    if (game > 0) {
-        kill(game, SIGSTOP);
-        stopped_game = game;
-    }
-    for (i = 0; i < 40; i++) {
-        int st = task_state(tid);
-        if (st == 'T' || st == 't') break;
-        usleep(10000);
-    }
+    (void)game;
+    if (wait_stop(tid, 40)) return;
     if (pt(PTRACE_INTERRUPT, tid, 0, 0) == 0)
-        wait_stop(tid, 500);
+        wait_stop(tid, 800);
     else
         wait_stop(tid, 200);
 }
@@ -454,11 +446,11 @@ static void ensure_stopped(pid_t game, pid_t tid) {
 
 static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n);
 
-/* 代码页必须走 ptrace。process_vm_writev 写得进，但不会刷指令缓存，游戏仍执行旧指令。 */
-static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
+/* ptrace 能刷指令缓存，但这台机子信号停住时会写失败。先用能写进的方式落字节，再尽力刷缓存。 */
+static int poke_ptrace_words(pid_t pid, uint64_t addr, const void *src, size_t n) {
     const unsigned char *p = src;
     size_t i = 0;
-    if (addr & 7) return poke_exact(pid, addr, src, n);
+    if (addr & 7) return -1;
     while (i + 8 <= n) {
         unsigned long word = 0;
         memcpy(&word, p + i, 8);
@@ -467,8 +459,32 @@ static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
             return -1;
         i += 8;
     }
-    if (i < n) return poke_exact(pid, addr + i, p + i, n - i);
-    return 0;
+    return i == n ? 0 : -1;
+}
+
+static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
+    struct iovec local;
+    struct iovec remote;
+    char mempath[64];
+    int fd, wrote = 0;
+    local.iov_base = (void *)src;
+    local.iov_len = n;
+    remote.iov_base = (void *)addr;
+    remote.iov_len = n;
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) wrote = 1;
+    if (!wrote) {
+        snprintf(mempath, sizeof mempath, "/proc/%d/mem", (int)pid);
+        fd = open(mempath, O_WRONLY);
+        if (fd >= 0) {
+            if (pwrite(fd, src, n, (off_t)addr) == (ssize_t)n) wrote = 1;
+            close(fd);
+        }
+    }
+    if (poke_ptrace_words(pid, addr, src, n) != 0 && !wrote) {
+        if (addr & 7) return poke_exact(pid, addr, src, n);
+        return -1;
+    }
+    return wrote || poke_ptrace_words(pid, addr, src, n) == 0 ? 0 : -1;
 }
 
 static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n) {
@@ -874,17 +890,20 @@ static int rx_span(pid_t pid, const char *needle, uint64_t *start, uint64_t *end
     return found;
 }
 
-static int locate_hook(pid_t game, size_t need, size_t back_off,
+static int locate_hook(pid_t game, size_t need, size_t back_off, int skip,
                        uint64_t *hook, uint32_t *orig, uint64_t *cave, uint64_t *app_base,
                        struct FileSite *site) {
     static const char *sys_libs[] = {"libc.so", "libdl.so", 0};
+    /* clock_gettime 常被 vdso 接走，挂它等于没挂。memcpy 每帧都执行。 */
     static const char *const sys_syms[] = {
-        "clock_gettime", "__clock_gettime", "gettimeofday", "nanosleep",
-        "ioctl", "read", "write", "memcpy", "malloc", "pthread_mutex_lock"
+        "memcpy", "memset", "memmove", "strlen",
+        "malloc", "free", "calloc",
+        "pthread_mutex_lock", "pthread_getspecific",
+        "read", "write", "ioctl", "nanosleep"
     };
     static const char *app_libs[] = {"libil2cpp.so", "libunity.so", "libmain.so", 0};
-    static const char *const app_syms[] = {"il2cpp_runtime_invoke", "il2cpp_init", "clock_gettime", "gettimeofday"};
-    int i, saw_file = 0, worst = -1;
+    static const char *const app_syms[] = {"il2cpp_runtime_invoke", "il2cpp_resolve_icall", "UnitySendMessage", "JNI_OnLoad"};
+    int i, saw_file = 0, worst = -1, left = skip;
     *app_base = 0;
     *hook = 0;
     *cave = 0;
@@ -916,7 +935,7 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
         } else {
             continue;
         }
-        rc = elf_hook_site_span(path, base, start, off, end, sys_syms, 10, need, back_off, hook, orig, cave);
+        rc = elf_hook_site_span(path, base, start, off, end, sys_syms, 13, need, back_off, &left, hook, orig, cave);
         if (rc == 0) {
             if (site) {
                 snprintf(site->path, sizeof site->path, "%s", path);
@@ -937,7 +956,7 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
         if (access(path, R_OK) != 0) continue;
         saw_file = 1;
         rx_span(game, app_libs[i], &start, &end, &off, path, sizeof path);
-        rc = elf_hook_site_span(path, base, start, off, end, app_syms, 4, need, back_off, hook, orig, cave);
+        rc = elf_hook_site_span(path, base, start, off, end, app_syms, 4, need, back_off, &left, hook, orig, cave);
         if (rc == 0) {
             if (site) {
                 snprintf(site->path, sizeof site->path, "%s", path);
@@ -962,7 +981,9 @@ static uint64_t biggest_app_exec(pid_t pid);
 
 /* 不改寄存器。把一条热指令换成跳转，由空隙里的代码自己 open 库再用 fd 加载。
  * 这样不靠应用命名空间是否允许这条路径。用完把原指令写回去。 */
-static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn) {
+static int flush_exec(pid_t tid, struct pt_regs_arm64 *saved, uint64_t addr);
+
+static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn, struct pt_regs_arm64 *saved) {
     uint64_t hook = 0;
     uint32_t orig = 0, next = 0;
     size_t blob_n, need, back_off, orig_off, flag_off, open_off, ext_off, dlopen_off, caller_off, path_lit_off;
@@ -991,7 +1012,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     caller_off = (size_t)(lit_caller - blob);
     path_lit_off = (size_t)(lit_path - blob);
     if (path_lit_off + 8 > blob_n || dlopen_off + 8 > blob_n) return -1;
-    if (locate_hook(game, need, back_off, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
+    if (locate_hook(game, need, back_off, 0, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
         boot_log("file hook miss\n");
         if (access("/data/local/tmp/phisap-why", R_OK) != 0)
             write_why("找不到游戏库入口");
@@ -1080,6 +1101,11 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
             write_why("写不进代码页");
             return -1;
         }
+        if (agot && dummy.sp) saved = &dummy;
+        if (saved && saved->sp) {
+            flush_exec(tid, saved, cave);
+            flush_exec(tid, saved, hook);
+        }
     }
     cont_game(game);
     detach_tid(tid);
@@ -1149,6 +1175,81 @@ static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
     write_regs(pid, saved);
     if (!got || timed_out) return -2;
     return 0;
+}
+
+static int call_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
+                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t sp,
+                       unsigned long *out) {
+    struct pt_regs_arm64 regs = *saved;
+    regs.regs[0] = a0;
+    regs.regs[1] = a1;
+    regs.regs[2] = a2;
+    regs.regs[30] = 0;
+    regs.pc = fn;
+    regs.sp = sp & ~0xfull;
+    if (write_regs(pid, &regs) < 0 || pt(PTRACE_CONT, pid, 0, 0) < 0) {
+        write_regs(pid, saved);
+        return -1;
+    }
+    int got = 0, st = 0;
+    for (int i = 0; i < 12 && !timed_out; i++) {
+        if (waitpid(pid, &st, 0) < 0) {
+            if (errno == EINTR && !timed_out) continue;
+            break;
+        }
+        if (!WIFSTOPPED(st)) break;
+        int sig = WSTOPSIG(st);
+        if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS) { got = 1; break; }
+        if (pt(PTRACE_CONT, pid, 0, 0) < 0) break;
+    }
+    read_regs(pid, &regs, 0);
+    *out = regs.regs[0];
+    write_regs(pid, saved);
+    if (!got || timed_out) return -2;
+    return 0;
+}
+
+static int flush_exec(pid_t tid, struct pt_regs_arm64 *saved, uint64_t addr) {
+    uint64_t mp, page, sp;
+    unsigned long out = 0;
+    if (!saved || !saved->sp || !addr) return -1;
+    mp = sym_in(tid, "libc.so", "mprotect");
+    if (!mp) return -1;
+    page = addr & ~0xfffull;
+    sp = (saved->sp - 0x200) & ~0xfull;
+    /* 先改成可写再改回可执行，让内核刷掉这块指令缓存。 */
+    if (call_remote(tid, saved, mp, page, 0x2000, 7, sp, &out) != 0) return -1;
+    return call_remote(tid, saved, mp, page, 0x2000, 5, sp, &out);
+}
+
+static int load_by_fd(pid_t tid, struct pt_regs_arm64 *saved, const char *so) {
+    uint64_t open_fn, ext_fn, path_at, info_at, sp;
+    unsigned long fd = 0, handle = 0;
+    unsigned char info[48];
+    int32_t fdi;
+    uint64_t flags = 0x10;
+    size_t n;
+    if (!so || !saved || !saved->sp) return -1;
+    open_fn = sym_in(tid, "libc.so", "openat");
+    if (!open_fn) open_fn = sym_in(tid, "libc.so", "__openat");
+    ext_fn = sym_in(tid, "libdl.so", "android_dlopen_ext");
+    if (!ext_fn) ext_fn = sym_in(tid, "linker64", "android_dlopen_ext");
+    if (!open_fn || !ext_fn) return -1;
+    n = strlen(so);
+    if (!n || n > 240) return -1;
+    path_at = (saved->sp - 0x400) & ~0xfull;
+    info_at = path_at + 0x100;
+    sp = (path_at - 0x200) & ~0xfull;
+    if (poke(tid, path_at, so, n + 1) != 0) return -1;
+    if (call_remote(tid, saved, open_fn, (uint64_t)-100, path_at, 0, sp, &fd) != 0) return -1;
+    if ((long)fd < 0) return -1;
+    memset(info, 0, sizeof info);
+    memcpy(info, &flags, 8);
+    fdi = (int32_t)fd;
+    memcpy(info + 28, &fdi, 4);
+    if (poke(tid, info_at, info, sizeof info) != 0) return -1;
+    if (call_remote(tid, saved, ext_fn, path_at, 2, info_at, sp, &handle) != 0) return -1;
+    return handle ? 0 : -1;
 }
 
 #ifndef PTRACE_O_TRACEFORK
@@ -2441,7 +2542,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-24\n");
+    boot_log("phisap-boot-25\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
@@ -2558,41 +2659,23 @@ int main(int argc, char **argv) {
     int got_regs = 0;
     pid_t traced = attach_any(pid, &saved, &reg_err, &got_regs);
     if (!traced) {
-        if (hook_inject(pid, pid, so, &fn) == 0) {
+        if (hook_inject(pid, pid, so, &fn, 0) == 0) {
             printf("ok hook\n");
             return 0;
         }
         fprintf(stderr, "附加上不去 %d\n", reg_err);
         return 1;
     }
+    if (got_regs && load_by_fd(traced, &saved, so) == 0 && so_mapped(pid)) {
+        detach_tid(traced);
+        printf("ok fd\n");
+        return 0;
+    }
     if (got_regs) {
-        unsigned long remote = (saved.sp - 512) & ~0xful;
-        char path[256];
-        unsigned long handle = 0;
-        int rc;
-        snprintf(path, sizeof path, "%s", so);
-        if (poke(traced, remote, path, strlen(path) + 1) == 0) {
-            rc = invoke_remote(traced, &saved, fn.addr, remote, 2, fn.caller, fn.loader, &handle);
-            if ((rc != 0 || !handle) && fn.fallback && fn.fallback != fn.addr && !timed_out) {
-                unsigned long handle2 = 0;
-                int rc2 = invoke_remote(traced, &saved, fn.fallback, remote, 2, 0, 0, &handle2);
-                if (rc2 == 0 && handle2) {
-                    handle = handle2;
-                    rc = 0;
-                } else if (rc == 0) {
-                    rc = rc2;
-                }
-            }
-            if (rc == 0 && handle) {
-                detach_tid(traced);
-                printf("ok %lx\n", handle);
-                return 0;
-            }
-        }
         pt(PTRACE_INTERRUPT, traced, 0, 0);
         wait_stop(traced, 80);
     }
-    if (hook_inject(pid, traced, so, &fn) == 0) {
+    if (hook_inject(pid, traced, so, &fn, got_regs ? &saved : 0) == 0) {
         printf("ok hook\n");
         return 0;
     }

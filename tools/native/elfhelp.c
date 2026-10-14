@@ -500,10 +500,36 @@ static uint64_t tail_cave(const Elf64_Phdr *ph, int nph, uint64_t bias, uint64_t
     return 0;
 }
 
+static int is_hint_insn(uint32_t insn) {
+    return (insn & 0xFFFFF01Fu) == 0xD503201Fu;
+}
+
+/* 跳过 BTI/PAC，再跟一条无条件跳转。跟不进文件就不要挂，挂在跳转后面是死代码。 */
+static int land_on_body(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph,
+                        uint64_t bias, uint64_t *addr) {
+    int n;
+    uint32_t insn = 0;
+    for (n = 0; n < 4; n++) {
+        if (read_insn(fd, file_base, ph, nph, bias, *addr, &insn) != 0) return -1;
+        if (!is_hint_insn(insn)) break;
+        *addr += 4;
+    }
+    if (read_insn(fd, file_base, ph, nph, bias, *addr, &insn) != 0) return -1;
+    if ((insn >> 26) == 0x05) {
+        uint32_t raw = insn & 0x03ffffffu;
+        int32_t imm = (int32_t)(raw << 6) >> 6;
+        uint64_t dest = *addr + ((int64_t)imm << 2);
+        uint32_t next = 0;
+        if (read_insn(fd, file_base, ph, nph, bias, dest, &next) != 0 || !next) return -1;
+        *addr = dest;
+    }
+    return 0;
+}
+
 int elf_hook_site_span(const char *path, uint64_t file_base,
                        uint64_t map_start, uint64_t map_off, uint64_t map_end,
                        const char *const *syms, int nsyms,
-                       size_t need, size_t back_off,
+                       size_t need, size_t back_off, int *skip,
                        uint64_t *hook, uint32_t *orig, uint64_t *cave) {
     int fd, i, saw_sym = 0, saw_insn = 0;
     Elf64_Ehdr eh;
@@ -522,26 +548,24 @@ int elf_hook_site_span(const char *path, uint64_t file_base,
         int step;
         if (!syms[i] || sym_addr(fd, file_base, ph, eh.e_phnum, bias, syms[i], &addr) != 0) continue;
         saw_sym = 1;
+        if (land_on_body(fd, file_base, ph, eh.e_phnum, bias, &addr) != 0) continue;
         if (read_insn(fd, file_base, ph, eh.e_phnum, bias, addr, &first) != 0) continue;
-        if ((first >> 26) == 0x05) {
-            uint32_t raw = first & 0x03ffffffu;
-            int32_t imm = (int32_t)(raw << 6) >> 6;
-            uint64_t dest = addr + ((int64_t)imm << 2);
-            uint32_t next = 0;
-            if (read_insn(fd, file_base, ph, eh.e_phnum, bias, dest, &next) == 0 && next) {
-                addr = dest;
-            }
-        }
+        (void)first;
         for (step = 0; step < 16; step++) {
             uint64_t at = addr + (uint64_t)step * 4;
             uint32_t insn = 0;
             uint64_t z;
             if (read_insn(fd, file_base, ph, eh.e_phnum, bias, at, &insn) != 0) break;
+            if ((insn >> 26) == 0x05) break;
             if (!hookable_insn(insn)) continue;
             saw_insn = 1;
             z = tail_cave(ph, eh.e_phnum, bias, map_end, at, need, back_off);
             if (!z) z = file_cave(fd, file_base, ph, eh.e_phnum, bias, at, need, back_off);
             if (!z) continue;
+            if (skip && *skip > 0) {
+                (*skip)--;
+                continue;
+            }
             *hook = at;
             *orig = insn;
             *cave = z;

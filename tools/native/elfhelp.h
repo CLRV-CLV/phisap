@@ -25,7 +25,7 @@ int elf_hook_site(const char *path, uint64_t file_base,
 int elf_hook_site_span(const char *path, uint64_t file_base,
                        uint64_t map_start, uint64_t map_off, uint64_t map_end,
                        const char *const *syms, int nsyms,
-                       size_t need, size_t back_off,
+                       size_t need, size_t back_off, int *skip,
                        uint64_t *hook, uint32_t *orig, uint64_t *cave);
 
 /* 已经有这个 DT_NEEDED 返回 1，否则 0。读失败返回 -1。 */
