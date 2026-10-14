@@ -71,3 +71,70 @@ lit_caller:
 lit_path:
     .quad 0
 blob_end:
+
+// 当作普通函数调用。先送库，再跳到原来的函数。不改已经在执行的指令。
+.global gblob
+.global gblob_end
+.global g_flag
+.global g_open
+.global g_ext
+.global g_path
+.global g_real
+gblob:
+    bti c
+    ldr x16, g_flag
+    cbz x16, g_call
+    ldrb w17, [x16]
+    cbnz w17, g_call
+    mov w17, #1
+    strb w17, [x16]
+    stp x0, x1, [sp, #-16]!
+    stp x2, x3, [sp, #-16]!
+    stp x4, x5, [sp, #-16]!
+    stp x6, x7, [sp, #-16]!
+    stp x8, x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    sub sp, sp, #64
+    ldr x16, g_open
+    cbz x16, g_restore
+    mov x0, #-100
+    ldr x1, g_path
+    mov w2, #0
+    blr x16
+    tbnz x0, #63, g_restore
+    mov w19, w0
+    ldr x16, g_ext
+    cbz x16, g_restore
+    mov x2, sp
+    stp xzr, xzr, [x2]
+    stp xzr, xzr, [x2, #16]
+    stp xzr, xzr, [x2, #32]
+    mov w1, #16
+    str w1, [x2]
+    str w19, [x2, #28]
+    ldr x0, g_path
+    mov w1, #2
+    blr x16
+g_restore:
+    add sp, sp, #64
+    ldp x19, x20, [sp], #16
+    ldp x8, x30, [sp], #16
+    ldp x6, x7, [sp], #16
+    ldp x4, x5, [sp], #16
+    ldp x2, x3, [sp], #16
+    ldp x0, x1, [sp], #16
+g_call:
+    ldr x16, g_real
+    br x16
+.align 3
+g_flag:
+    .quad 0
+g_open:
+    .quad 0
+g_ext:
+    .quad 0
+g_path:
+    .quad 0
+g_real:
+    .quad 0
+gblob_end:

@@ -967,6 +967,133 @@ int elf_drop_needed(const char *path, const char *soname) {
     return -1;
 }
 
+static int rela_name_is(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph,
+                        uint64_t sym_v, uint64_t str_v, uint32_t symi, const char *want) {
+    Elf64_Sym sym;
+    uint64_t sym_off, str_off;
+    char name[96];
+    ssize_t nr;
+    if (!want || !want[0]) return 0;
+    sym_off = v2off(ph, nph, sym_v);
+    str_off = v2off(ph, nph, str_v);
+    if (!sym_off || !str_off) return 0;
+    if (pread_full(fd, &sym, sizeof sym, file_base + sym_off + (uint64_t)symi * sizeof sym) != 0) return 0;
+    if (!sym.st_name) return 0;
+    nr = pread(fd, name, sizeof name - 1, (off_t)(file_base + str_off + sym.st_name));
+    if (nr <= 0) return 0;
+    name[nr] = 0;
+    return strcmp(name, want) == 0;
+}
+
+static int scan_rela(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph, uint64_t bias,
+                     uint64_t sym_v, uint64_t str_v, uint64_t rela_v, uint64_t rela_sz,
+                     const char *want, uint64_t *slot) {
+    uint64_t off, n, count;
+    if (!rela_v || rela_sz < sizeof(Elf64_Rela) || !slot) return -1;
+    off = v2off(ph, nph, rela_v);
+    if (!off) return -1;
+    off += file_base;
+    count = rela_sz / sizeof(Elf64_Rela);
+    if (count > 2000000) count = 2000000;
+    for (n = 0; n < count; n++) {
+        Elf64_Rela r;
+        uint32_t type, symi;
+        if (pread_full(fd, &r, sizeof r, off + n * sizeof r) != 0) return -1;
+        type = (uint32_t)(r.r_info & 0xffffffffu);
+        if (type != 1026 && type != 1025) continue;
+        symi = (uint32_t)(r.r_info >> 32);
+        if (!rela_name_is(fd, file_base, ph, nph, sym_v, str_v, symi, want)) continue;
+        *slot = bias + r.r_offset;
+        return 0;
+    }
+    return -1;
+}
+
+int elf_got_slot(const char *path, uint64_t file_base,
+                 uint64_t map_start, uint64_t map_off,
+                 const char *want, uint64_t *slot) {
+    int fd, i;
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[64];
+    Elf64_Phdr dynph;
+    uint64_t bias = 0, dyn_off, dyn_sz;
+    uint64_t sym_v = 0, str_v = 0, rela_v = 0, rela_sz = 0, jmp_v = 0, plt_sz = 0;
+    if (!path || !want || !slot) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (load_elf(fd, file_base, &eh, ph, 64) != 0 ||
+        bias_of(ph, eh.e_phnum, map_start, map_off, file_base, &bias) != 0) {
+        close(fd);
+        return -1;
+    }
+    memset(&dynph, 0, sizeof dynph);
+    for (i = 0; i < eh.e_phnum && i < 64; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) dynph = ph[i];
+    }
+    if (dynph.p_filesz < sizeof(Elf64_Dyn)) {
+        close(fd);
+        return -1;
+    }
+    dyn_off = file_base + dynph.p_offset;
+    dyn_sz = dynph.p_filesz;
+    for (uint64_t n = 0; n + sizeof(Elf64_Dyn) <= dyn_sz; n += sizeof(Elf64_Dyn)) {
+        Elf64_Dyn d;
+        if (pread_full(fd, &d, sizeof d, dyn_off + n) != 0) break;
+        if (d.d_tag == DT_NULL) break;
+        if (d.d_tag == DT_SYMTAB) sym_v = d.d_un.d_ptr;
+        if (d.d_tag == DT_STRTAB) str_v = d.d_un.d_ptr;
+        if (d.d_tag == DT_RELA) rela_v = d.d_un.d_ptr;
+        if (d.d_tag == DT_RELASZ) rela_sz = d.d_un.d_val;
+        if (d.d_tag == DT_JMPREL) jmp_v = d.d_un.d_ptr;
+        if (d.d_tag == DT_PLTRELSZ) plt_sz = d.d_un.d_val;
+    }
+    if (!sym_v || !str_v) {
+        close(fd);
+        return -1;
+    }
+    if (scan_rela(fd, file_base, ph, eh.e_phnum, bias, sym_v, str_v, jmp_v, plt_sz, want, slot) == 0 ||
+        scan_rela(fd, file_base, ph, eh.e_phnum, bias, sym_v, str_v, rela_v, rela_sz, want, slot) == 0) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    return -1;
+}
+
+int elf_writable_tail(const char *path, uint64_t file_base,
+                      uint64_t map_start, uint64_t map_off, uint64_t map_end,
+                      uint64_t *tail, uint64_t *room) {
+    int fd, i;
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[64];
+    uint64_t bias = 0, elf_off, content_end, at;
+    if (!path || !tail || !room || map_end <= map_start) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (load_elf(fd, file_base, &eh, ph, 64) != 0 ||
+        bias_of(ph, eh.e_phnum, map_start, map_off, file_base, &bias) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (map_off < file_base) return -1;
+    elf_off = map_off - file_base;
+    for (i = 0; i < eh.e_phnum && i < 64; i++) {
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_W)) continue;
+        if (elf_off < ph[i].p_offset || elf_off >= ph[i].p_offset + (ph[i].p_filesz ? ph[i].p_filesz : 1))
+            continue;
+        content_end = bias + ph[i].p_vaddr + ph[i].p_memsz;
+        if (content_end < map_start || content_end >= map_end) continue;
+        if (map_end - content_end > 0x1000) continue;
+        at = (content_end + 7) & ~7ull;
+        if (at >= map_end || map_end - at < 8) continue;
+        *tail = at;
+        *room = map_end - at;
+        return 0;
+    }
+    return -1;
+}
+
 #ifdef ELFHELP_TEST
 int main(int argc, char **argv) {
     if (argc < 2) return 2;

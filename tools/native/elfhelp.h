@@ -28,6 +28,16 @@ int elf_hook_site_span(const char *path, uint64_t file_base,
                        size_t need, size_t back_off, int *skip,
                        uint64_t *hook, uint32_t *orig, uint64_t *cave);
 
+/* 找导入符号的 GOT 槽运行时地址。成功 0。 */
+int elf_got_slot(const char *path, uint64_t file_base,
+                 uint64_t map_start, uint64_t map_off,
+                 const char *sym, uint64_t *slot);
+
+/* 可写段页尾的空白。成功 0，*tail 是运行时地址，*room 是可用字节。 */
+int elf_writable_tail(const char *path, uint64_t file_base,
+                      uint64_t map_start, uint64_t map_off, uint64_t map_end,
+                      uint64_t *tail, uint64_t *room);
+
 /* 已经有这个 DT_NEEDED 返回 1，否则 0。读失败返回 -1。 */
 int elf_has_needed(const char *path, const char *soname);
 

@@ -23,6 +23,8 @@
 
 ssize_t process_vm_writev(pid_t pid, const struct iovec *local_iov, unsigned long liovcnt,
                           const struct iovec *remote_iov, unsigned long riovcnt, unsigned long flags);
+ssize_t process_vm_readv(pid_t pid, const struct iovec *local_iov, unsigned long liovcnt,
+                         const struct iovec *remote_iov, unsigned long riovcnt, unsigned long flags);
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
@@ -35,7 +37,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-25";
+static const char INJECT_MARK[] = "phisap-inject-26";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -230,9 +232,20 @@ static pid_t attach_any(pid_t pid, struct pt_regs_arm64 *out, int *err, int *got
         closedir(d);
     }
     if (n < 32) order[n++] = pid;
-    /* 不要先 SIGCONT。信号停住的线程上读寄存器会返回 EBUSY。 */
-    for (i = 0; i < n && !timed_out; i++) {
-        if (attach_one(order[i], out, err, got_regs)) return order[i];
+    /* 不要先 SIGCONT。信号停住的线程上读寄存器会返回 EBUSY。有寄存器的线程优先。 */
+    {
+        pid_t fallback = 0;
+        for (i = 0; i < n && !timed_out; i++) {
+            int got = 0;
+            if (!attach_one(order[i], out, err, &got)) continue;
+            if (got) {
+                *got_regs = 1;
+                return order[i];
+            }
+            if (!fallback) fallback = order[i];
+            detach_tid(order[i]);
+        }
+        if (fallback && attach_one(fallback, out, err, got_regs)) return fallback;
     }
     return 0;
 }
@@ -353,6 +366,13 @@ extern char lit_ext[];
 extern char lit_dlopen[];
 extern char lit_caller[];
 extern char lit_path[];
+extern char gblob[];
+extern char gblob_end[];
+extern char g_flag[];
+extern char g_open[];
+extern char g_ext[];
+extern char g_path[];
+extern char g_real[];
 
 static int so_mapped(pid_t pid) {
     char path[64];
@@ -1250,6 +1270,148 @@ static int load_by_fd(pid_t tid, struct pt_regs_arm64 *saved, const char *so) {
     if (poke(tid, info_at, info, sizeof info) != 0) return -1;
     if (call_remote(tid, saved, ext_fn, path_at, 2, info_at, sp, &handle) != 0) return -1;
     return handle ? 0 : -1;
+}
+
+static int read_mem(pid_t pid, uint64_t addr, void *dst, size_t n) {
+    struct iovec local = { dst, n };
+    struct iovec remote = { (void *)addr, n };
+    char path[64];
+    int fd;
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) return 0;
+    snprintf(path, sizeof path, "/proc/%d/mem", (int)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (pread(fd, dst, n, (off_t)addr) != (ssize_t)n) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int write_mem(pid_t pid, uint64_t addr, const void *src, size_t n) {
+    struct iovec local = { (void *)src, n };
+    struct iovec remote = { (void *)addr, n };
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) return 0;
+    return poke(pid, addr, src, n);
+}
+
+/* 改游戏自己的调用表，不改已经在执行的指令。下一次 memcpy 就会进来。 */
+static int got_redirect(pid_t game, const char *so) {
+    static const char *syms[] = {"memcpy", "malloc", "memset", "strlen", "pthread_mutex_lock"};
+    struct GotHit { uint64_t slot, saved; } hits[8];
+    char seen[24][256];
+    int nseen = 0, nhit = 0, si, waited, mapped;
+    uint64_t real = 0, cave = 0, hook = 0, app_base = 0, flag_at = 0, path_at = 0;
+    uint64_t open_fn, ext_fn;
+    uint32_t orig = 0;
+    size_t gn, body, need, plen;
+    unsigned char tmp[512], flag = 0, zero = 0;
+    struct FileSite site;
+    FILE *maps;
+    char maps_path[64], line[512];
+    if (!game || !so || so[0] != '/') return -1;
+    plen = strlen(so);
+    if (!plen || plen > 240) return -1;
+    gn = (size_t)(gblob_end - gblob);
+    body = (gn + 7u) & ~7u;
+    need = body + 256;
+    if (gn < 32 || need > sizeof tmp) return -1;
+    memset(&site, 0, sizeof site);
+    if (locate_hook(game, need, 8, 0, &hook, &orig, &cave, &app_base, &site) != 0 || !cave)
+        return -1;
+    snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", (int)game);
+    maps = fopen(maps_path, "r");
+    if (!maps) return -1;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long long a = 0, b = 0, o = 0;
+        char perms[8] = {0};
+        char path[256];
+        char *slash;
+        int dup = 0, k;
+        uint64_t slot = 0, file_base = 0, tail = 0, room = 0;
+        if (sscanf(line, "%llx-%llx %7s %llx", &a, &b, perms, &o) < 3) continue;
+        slash = strchr(line, '/');
+        if (!slash) continue;
+        sscanf(slash, "%255s", path);
+        if (!path[0]) continue;
+        if (strstr(path, "/system/") || strstr(path, "/apex/") || strstr(path, "/vendor/") ||
+            strstr(path, "libc.so") || strstr(path, "linker") || strstr(path, "libdl.so"))
+            continue;
+        for (k = 0; k < nseen; k++) if (strcmp(seen[k], path) == 0) dup = 1;
+        if (dup) {
+            if (!flag_at && strchr(perms, 'w') && !strchr(perms, 'x') &&
+                elf_writable_tail(path, strstr(path, ".apk") ? o : 0, a, o, b, &tail, &room) == 0 && room >= 8)
+                flag_at = tail;
+            continue;
+        }
+        if (nseen < 24) {
+            snprintf(seen[nseen], sizeof seen[nseen], "%s", path);
+            nseen++;
+        }
+        if (strstr(path, ".apk")) file_base = o;
+        if (!strchr(perms, 'x')) {
+            if (!flag_at && strchr(perms, 'w') &&
+                elf_writable_tail(path, file_base, a, o, b, &tail, &room) == 0 && room >= 8)
+                flag_at = tail;
+            continue;
+        }
+        for (si = 0; si < 5 && nhit < 8; si++) {
+            uint64_t got = 0;
+            if (elf_got_slot(path, file_base, a, o, syms[si], &slot) != 0 || !slot) continue;
+            if (read_mem(game, slot, &got, 8) != 0 || got < 0x10000) continue;
+            if (!real) real = got;
+            if (got != real) continue;
+            hits[nhit].slot = slot;
+            hits[nhit].saved = got;
+            nhit++;
+            break;
+        }
+    }
+    fclose(maps);
+    if (!nhit || !real || !flag_at) return -1;
+    open_fn = sym_in(game, "libc.so", "openat");
+    if (!open_fn) open_fn = sym_in(game, "libc.so", "__openat");
+    ext_fn = sym_in(game, "libdl.so", "android_dlopen_ext");
+    if (!ext_fn) ext_fn = sym_in(game, "linker64", "android_dlopen_ext");
+    if (!open_fn || !ext_fn) return -1;
+    path_at = cave + body;
+    memset(tmp, 0, need);
+    memcpy(tmp, gblob, gn);
+    memcpy(tmp + (g_flag - gblob), &flag_at, 8);
+    memcpy(tmp + (g_open - gblob), &open_fn, 8);
+    memcpy(tmp + (g_ext - gblob), &ext_fn, 8);
+    memcpy(tmp + (g_path - gblob), &path_at, 8);
+    memcpy(tmp + (g_real - gblob), &real, 8);
+    memcpy(tmp + body, so, plen + 1);
+    if (write_mem(game, cave, tmp, need) != 0 || write_mem(game, flag_at, &zero, 1) != 0)
+        return -1;
+    for (si = 0; si < nhit; si++) {
+        if (write_mem(game, hits[si].slot, &cave, 8) != 0) {
+            while (si-- > 0) write_mem(game, hits[si].slot, &hits[si].saved, 8);
+            return -1;
+        }
+    }
+    boot_log("got redirect\n");
+    if (attached_tid) pt(PTRACE_CONT, attached_tid, 0, 0);
+    cont_game(game);
+    waited = 0;
+    while (waited < 2500 && !timed_out) {
+        if (so_mapped(game)) break;
+        usleep(20000);
+        waited += 20;
+    }
+    mapped = so_mapped(game);
+    read_mem(game, flag_at, &flag, 1);
+    for (si = 0; si < nhit; si++)
+        write_mem(game, hits[si].slot, &hits[si].saved, 8);
+    if (attached_tid) {
+        pt(PTRACE_INTERRUPT, attached_tid, 0, 0);
+        wait_stop(attached_tid, 400);
+    }
+    if (mapped) return 0;
+    write_why(flag ? "游戏打不开库文件" : "入口没被调用");
+    return -1;
 }
 
 #ifndef PTRACE_O_TRACEFORK
@@ -2542,7 +2704,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-25\n");
+    boot_log("phisap-boot-26\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
@@ -2669,6 +2831,12 @@ int main(int argc, char **argv) {
     if (got_regs && load_by_fd(traced, &saved, so) == 0 && so_mapped(pid)) {
         detach_tid(traced);
         printf("ok fd\n");
+        return 0;
+    }
+    if (got_redirect(pid, so) == 0) {
+        detach_tid(traced);
+        cont_game(pid);
+        printf("ok got\n");
         return 0;
     }
     if (got_regs) {
